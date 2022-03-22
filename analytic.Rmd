@@ -1,0 +1,1203 @@
+---
+title: "Untitled"
+output: 
+  word_document
+---
+# Main paper
+```{r setup, include=FALSE, results='hide'}
+knitr::opts_chunk$set(echo = FALSE, warning=FALSE,message=FALSE)
+
+library(tidyverse)
+library(fixest)
+library(modelsummary)
+library(lubridate)
+library(collapse)
+```
+
+```{r load, results='hide',cache=TRUE}
+analytic_raw<-
+  read_csv("./Data/combined_analytic.csv")
+
+state_analytic_raw<-
+  read_csv("./Data/state_analytic.csv")
+
+normalization<-
+  read_csv("./Data/consol_normalization.csv.gz")
+
+# normalization needs population data too--how many people does each device represent?
+normalization<-
+  normalization%>%
+  inner_join(select(state_analytic_raw,state_fips,date,pop))%>%
+  mutate(rescale=pop/total_devices_seen)
+
+# balance the analytic file
+analytic<-
+  analytic_raw%>%
+  filter(eyear %in% 2019:2020,eweek %in% 6:23,dow %in% 2:6)%>%
+  group_by(placekey)%>%
+  mutate(n_days=n(),
+         )%>%
+  ungroup()
+
+interpolated<-
+  analytic%>%filter(!is.na(weekly_visit_counts))%>%
+  mutate(interpolated=if_else(weekly_visit_counts>0,0,1))%>%
+  distinct(placekey,eweek,year20,interpolated)%>%
+  group_by(placekey)%>%
+  mutate(max_interpolated=max(interpolated))%>%
+  ungroup()
+
+analytic<-
+  analytic%>%
+  inner_join(interpolated)
+
+analytic<-
+  analytic%>%
+  inner_join(select(normalization,state_fips,date,rescale,total_visits))
+
+analytic<-
+  analytic%>%
+  mutate(across(c(visitors,weekly_visit_counts,weekly_visitor_counts,visitors_dur_1h,visitors_dur_1_4h,visitors_dur_4h,in_state,out_state),~rescale*.))
+
+state_analytic<-
+  state_analytic_raw%>%
+  filter(eyear %in% 2019:2020,eweek %in% 6:23)%>%
+  group_by(state_fips)%>%
+  mutate(n_days=n(),
+         stay_at_home_ne=pmax(stay_at_home,nonessential),
+         adj_weekly_visits=weekly_visit_counts-visitors_dur_4h)%>%
+  ungroup()%>%
+  inner_join(select(normalization,state_fips,date,rescale,total_visits))
+
+state_analytic<-
+  state_analytic%>%
+  mutate(across(c(visitors,weekly_visit_counts,weekly_visitor_counts,visitors_dur_1h,visitors_dur_1_4h,visitors_dur_4h,in_state,out_state,within_state_visitors,outof_state_visitors,left_state_visitors),~rescale*.))
+
+
+lau_all_raw<-
+  read_tsv(c("https://download.bls.gov/pub/time.series/la/la.data.0.CurrentU20-24","https://download.bls.gov/pub/time.series/la/la.data.0.CurrentU15-19"))
+
+lau_series<-
+  read_tsv("https://download.bls.gov/pub/time.series/la/la.series", guess_max = 100000)
+
+lau_all<-
+  lau_all_raw%>%
+  select(-footnote_codes)%>%
+  filter(period!="M13")%>%
+  mutate(date=zoo::as.Date(zoo::as.yearmon(paste0(str_remove(period,"^M"),"/",year), "%m/%Y")))%>%
+  inner_join(lau_series)%>%
+  mutate(state_fips=str_sub(area_code,3,4),
+         county_fips=str_sub(area_code,3,7))%>%
+  select(date,unemployment_rate=value,area_type_code,measure_code,state_fips,county_fips)
+  
+  
+county_series<-
+  lau_all%>%filter(area_type_code=="F",measure_code=="03")%>%
+  select(county_fips,date,unemployment_rate)%>%
+  mutate(across(c(county_fips,unemployment_rate),~as.numeric(.)))%>%
+  filter(county_fips<57000)
+
+state_series<-
+  lau_all%>%filter(area_type_code=="A",measure_code=="03")%>%
+  select(state_fips,date,unemployment_rate)%>%
+  mutate(across(c(state_fips,unemployment_rate),~as.numeric(.)))%>%
+  filter(state_fips<57)
+  
+analytic<-
+  analytic%>%
+  mutate(month_start=lubridate::round_date(date,unit="month"))%>%
+  inner_join(county_series,by=c("county_fips","month_start"="date"))
+
+analytic<-
+  analytic%>%
+  filter(n_days==max(n_days), dow %in% 2:6, eweek %in% 6:22)%>%
+  distinct(state_fips,placekey)%>%
+  count(state_fips)%>%
+  rename(balanced_clinics=n)%>%
+  inner_join(distinct(state_analytic,state_fips,state_pop=pop))%>%
+  inner_join(analytic)
+
+
+state_analytic<-
+  state_analytic%>%
+  mutate(month_start=lubridate::round_date(date,unit="month"))%>%
+  inner_join(state_series,by=c("state_fips","month_start"="date"))
+
+
+county_analytic_raw<-
+  read_csv("./Data/county_analytic.csv")
+
+county_denom<-
+  read_csv("./Data/county_home_panel_summaries.csv")%>%
+  mutate(county_fips=as.numeric(county_fips))%>%
+  filter(!is.na(county_fips))
+
+county_analytic<-
+  county_analytic_raw%>%
+  filter(eyear %in% 2019:2020,eweek %in% 6:23)%>%
+  group_by(placekey,home_county_fips)%>%
+  filter(max(visitor_count)>0)%>%
+  ungroup()%>%
+  inner_join(county_denom,by=c("home_county_fips"="county_fips","date"))%>%
+  mutate(month_start=lubridate::round_date(date,unit="month"))%>%
+  inner_join(county_series,by=c("home_county_fips"="county_fips","month_start"="date"))
+
+```
+
+```{r load-cdc-mmwr, cache=TRUE}
+abortion_tables<-rvest::read_html("https://www.cdc.gov/mmwr/volumes/70/ss/ss7009a1.htm")%>%rvest::html_elements("table")%>%rvest::html_table()
+
+cdc_mmwr_abortions_by_state<-
+  abortion_tables[[2]][c(1,2,5)]%>%
+  filter(`State/Area`!="State/Area")%>%
+  left_join(tigris::fips_codes%>%distinct(state_name,state_code,postal=state),by=c("State/Area"="state_name"))%>%
+  mutate(across(-c(`State/Area`,state_code,postal),~replace_na(as.numeric(str_extract(str_remove_all(.,","),"^([0-9]+)")),0)))
+
+names(cdc_mmwr_abortions_by_state)<-
+  c("State/Area","total_abortions_reported","out_of_state_abortions","state_code","postal")
+
+cdc_mmwr_methods_by_states<-
+  abortion_tables[[12]]
+
+names(cdc_mmwr_methods_by_states)<-
+  c("State/Area","Surgical, ≤13 weeks’ gestation",
+    "Surgical, >13 weeks’ gestation","Surgical, unknown gestational age",
+    "Medical, ≤9 weeks’ gestation","Medical, >9 weeks’ gestation",
+    "Medical, unknown gestational age","Intrauterine instillation§","Hysterectomy/ Hysterotomy","Total abortions reported by known method type")
+    
+cdc_mmwr_methods_by_states<-
+  cdc_mmwr_methods_by_states%>%
+  filter(`State/Area`!="State/Area")%>%
+  mutate(`State/Area`=str_extract(`State/Area`,"^([[:alpha:],\\h])*"))%>%
+  left_join(tigris::fips_codes%>%distinct(state_name,state_code),by=c("State/Area"="state_name"))
+
+cdc_mmwr_methods_by_states<-
+  cdc_mmwr_methods_by_states%>%
+  rowwise()%>%
+  mutate(across(-c(`State/Area`,state_code),~replace_na(as.numeric(str_extract(str_remove_all(.,","),"^([0-9]+)")),0)),
+         surgical_abortions=sum(c_across(contains("Surgical"))),
+         medical_abortions=sum(c_across(contains("Medical"))),
+         other_abortions=`Intrauterine instillation§`+`Hysterectomy/ Hysterotomy`,
+         check_abortions=`Total abortions reported by known method type`-surgical_abortions-medical_abortions
+  )%>%
+  ungroup()%>%
+  select(`State/Area`,state_code,surgical_abortions,medical_abortions,other_abortions)
+  
+cdc_mmwr_data<-
+  cdc_mmwr_abortions_by_state%>%
+  inner_join(cdc_mmwr_methods_by_states)
+```
+```{r load-guttmacher-ranking}
+hostility<-
+  read_csv("./Data/guttmacher_hostility.csv")%>%
+  inner_join(tigris::fips_codes%>%distinct(state_name,state_code),by=c("State"="state_name"))%>%
+  filter(state_code<57)%>%
+  mutate(gm_rank=case_when(Count<=-6~"Very hostile",
+                           Count<=-4~"Hostile",
+                           Count<=-2~"Leaning hostile",
+                           Count<=1~"Middle ground",
+                           Count<=3~"Leaning supportive",
+                           Count<=5~"Supportive",
+                           Count<=6~"Very supportive",
+                           ),
+         gm_coarse=case_when(Count<=-1~"Hostile",
+                             Count<=6~"Supportive",
+                             ))%>%
+  select(-Count)
+```
+
+
+```{r load-planb}
+planb_table<-
+  rvest::read_html("https://www.guttmacher.org/state-policy/explore/refusing-provide-health-services")%>%
+  rvest::html_node("table")%>%
+  rvest::html_table()
+
+
+planb_table<-
+  planb_table%>%
+  rename(state=X1,
+         `Provider may refuse abortion`=X2,
+         `Institution may refuse abortion`=X3,
+         `Provider may refuse contraception`=X4,
+         `Pharmacist may refuse contraception`=X5,
+         `Institution may refuse contraception`=X6,
+         `Provider may refuse sterilization`=X7,
+         `Institution may refuse sterilization`=X8
+         )%>%
+  full_join(tigris::fips_codes%>%distinct(state_name,state_code),by=c("state"="state_name"))%>%
+  filter(state_code<57)
+
+
+planb_table<-
+  planb_table%>%
+  mutate(
+    across(`Provider may refuse abortion`:`Institution may refuse sterilization`,~replace_na(.,"")),
+    across(`Provider may refuse abortion`:`Institution may refuse sterilization`,~if_else(.!="",1,0)),
+    any_planb_restriction=pmax(`Provider may refuse contraception`,`Pharmacist may refuse contraception`),
+    any_planb_restriction=case_when(any_planb_restriction==0~"No contraception restriction",
+                                    any_planb_restriction==1~"Provider/pharmacist may refuse contraception")
+    )
+
+planb_table<-
+  planb_table%>%
+  full_join(hostility)%>%
+  mutate(state_code=as.numeric(state_code))
+
+analytic<-
+  analytic%>%
+  inner_join(select(planb_table,state_fips=state_code,any_planb_restriction,gm_coarse))
+
+
+state_analytic<-
+  state_analytic%>%
+  inner_join(select(planb_table,state_fips=state_code,any_planb_restriction,gm_coarse))
+```
+
+
+```{r configure}
+stars=c('*' = .1, '**' = .05,'***'=0.01)
+
+setFixest_fml(..baseline=~year20+elective_ban+holiday+unemployment_rate)
+```
+
+
+
+```{r estimate}
+
+# estimate models
+state_models<-
+  fepois(fml=c(visitors,median_dwell,distance_from_home,visitors_dur_1h,visitors_dur_1_4h,visitors_dur_4h,weekly_visit_counts,weekly_visitor_counts,within_state_visitors,outof_state_visitors,left_state_visitors)
+         ~..baseline+sw(surgical,surgical2)+new7_cases_per100k+stay_at_home_ne | state_fips+eweek^dow,
+               data=filter(state_analytic,n_days==max(n_days), dow %in% 2:6, eweek %in% 6:22), weights=~pop,
+         cluster=~state_fips)
+              
+# clinic level models
+clinic_models<-
+  fepois(fml=visitors         ~..baseline+
+           sw(surgical,
+              surgical+new7_cases_per100k,
+              surgical+new7_cases_per100k+stay_at_home_ne,
+              surgical+cum_cases_per100k, 
+              surgical+cum_cases_per100k+stay_at_home_ne,
+              surgical2,
+              surgical2+new7_cases_per100k,
+              surgical2+new7_cases_per100k+stay_at_home_ne,
+              surgical2+cum_cases_per100k, 
+              surgical2+cum_cases_per100k+stay_at_home_ne
+              )| placekey+eweek^dow,
+         data=filter(analytic,n_days==max(n_days), dow %in% 2:6, eweek %in% 6:22), cluster=~state_fips)
+
+clinic_visitor_metrics<-
+  fepois(fml=c(visitors,
+               weekly_visit_counts,
+               weekly_visitor_counts,
+               distance_from_home,
+               median_dwell,
+               in_state,
+               out_state
+               )
+         ~..baseline+sw(surgical,surgical2)+new7_cases_per100k+stay_at_home_ne| placekey+eweek^dow,
+         data=filter(analytic,n_days==max(n_days), dow %in% 2:6, eweek %in% 6:22), cluster=~state_fips,fsplit=~surgical_abortion)
+
+# gm=gof_map
+# gm$omit[!gm$raw %in% c('nobs','pseudo.r.squared')] = TRUE
+```
+
+```{r setup_fitstats}
+
+options("modelsummary_get" = "broom")
+
+
+fitstat_register("nclinics", function(x) x$fixef_sizes["placekey"], "Number of clinics")
+fitstat_register("nstates", function(x) x$fixef_sizes["state_fips"], "Number of clinics")
+fitstat_register("cor2a", function(x) r2(x,"cor2"), "Squared correlation")
+
+
+
+f1 <- function(x) format(round(x, 3), big.mark=",")
+f2 <- function(x) format(round(x, 0), big.mark=",")
+gm <- list(
+  list("raw" = "nobs", "clean" = "N", "fmt" = f2),
+  list("raw"="cor2a","clean"="Squared correlation",fmt="f1"),
+  list("raw"="nclinics","clean"="# of clinics",fmt="f2"),
+  list("raw"="my","clean"="Mean of dependent variable",fmt="f1")
+  )
+
+
+coef_map=c("year20"="2020",
+           "ATT"="Elective procedures ban",
+           "elective_ban"="Elective procedures ban",
+           "surgical"="Surgical abortion ban",
+           "surgical2"="Surgical abortion ban (alt)",
+           "holiday"="Holiday",
+           "new7_cases_per100k"="New COVID-19 cases per 100,000",
+           "stay_at_home_ne"="Stay at home / Non-essential business closure",
+           "cum_cases_per100k"="COVID-19 cases per 100,000",
+           "unemployment_rate"="Unemployment rate",
+           "log(visitors_2019)"="Log abortion clinic visits (2019)",
+           "log(surgical_visitors_2019)"="Log surgical abortion clinic visits (2019)",
+           "log(medication_visitors_2019)"="Log medication abortion clinic visits (2019)",
+           "log(total_visits)"="Log total visits",
+           ".theta"="Overdispersion"
+           )
+  
+
+tidy_custom.fixest <- function(x) {
+    out <- broom::tidy(x)
+    out$std.error <-exp(out$estimate) * out$std.error
+    out$estimate <- exp(out$estimate)-1
+    return(out)
+}
+
+tidy_custom.fixest_multi <- function(x) {
+    out <- broom::tidy(x)
+    out$std.error <-exp(out$estimate) * out$std.error
+    out$estimate <- exp(out$estimate)-1
+    return(out)
+}
+
+out_models<-function(model_list,...){
+  modelsummary(model_list,stars=stars,fmt="%.3g",gof_map=gm,coef_map = coef_map,...)
+
+}
+```
+
+```{r define-add_Ftest}
+add_Ftest<-function(model) {
+  b=coef(model)
+  V=vcov(model)
+  
+  V=V[names(b),names(b)]
+
+  Tmat=cbind(0*b,0*b)
+  Tmat["year20",1]=1
+  Tmat["unemployment_rate",2]=1
+  
+  stat=(b%*%Tmat)%*%solve(t(Tmat)%*%V%*%Tmat)%*%t(b%*%Tmat)
+  df=Matrix::rankMatrix(Tmat)[[1]]
+  p=pchisq(stat,df,lower.tail = FALSE)
+  
+  return(
+    list("chisq"=stat,
+         "df"=df,
+         "p"=p)
+  )
+}
+```
+
+
+
+## Figure 1: Map of clinics
+
+```{r load-map, results='hide',cache=TRUE}
+usmap<-tigris::states(cb=TRUE)
+
+```
+
+```{r clinic_map, echo=FALSE, message=FALSE, fig.cap="Procedure restrictions and clinics locations in the contiguous United States"}
+core<-read_csv("Data/2021_07_07_core.csv.gz",col_select = c(placekey,latitude,longitude))
+
+clinics<-
+  analytic%>%
+  filter(eweek %in% 6:22, eyear==2020, !state_fips %in% c(2, 15))%>%
+  group_by(placekey,state_fips)%>%
+  summarize(class=case_when(max(surgical2)==1~"Surgical abortion ban",
+                         max(elective_ban)==1~"Elective procedure ban",
+                         TRUE~"No restrictions"),
+            .groups="drop")%>%
+  inner_join(core)%>%
+  sf::st_as_sf(coords=c("longitude","latitude"),crs=sf::st_crs(usmap))
+  
+usmap<-
+  usmap%>%
+  mutate(state_fips=as.numeric(GEOID))%>%
+  left_join(distinct(as_tibble(clinics),state_fips,class))%>%
+  filter(state_fips<57, !state_fips %in% c(2,15))%>%
+  mutate(class=case_when(state_fips==38~"No restrictions",
+                         state_fips==56~"No restrictions",
+                         state_fips==21~"Elective procedure ban",
+                         state_fips==22~"Surgical abortion ban",
+                         TRUE~class))
+  
+
+ggplot()+
+  geom_sf(data=usmap,aes(fill=class))+
+  geom_sf(data=clinics)+
+  scale_fill_discrete(name=element_blank())+
+  ggthemes::theme_map()
+
+```
+
+
+## Table 1: Summary Statistics
+
+```{r summ-stats}
+
+datasummary(pop+cum_cases_per100k+new7_cases_per100k+holiday+surgical+surgical2+elective_ban+year20+unemployment_rate~N+mean+sd+min+max,
+            data=filter(analytic,n_days==max(n_days), dow %in% 2:6, eweek %in% 6:22),title="Summary stats")
+```
+
+
+## Figure 2
+
+```{r visits_time,fig.cap="Raw Differences in Abortion Clinic Visits (2020 visits minus 2019 visits)"}
+
+
+
+analytic%>%
+  filter(n_days==max(n_days))%>%
+  group_by(state_fips)%>%
+  mutate(class=case_when(max(surgical2)==1~"Surgical abortion ban",
+                         max(elective_ban)==1~"Elective procedure ban",
+                         TRUE~"No restrictions"))%>%
+  group_by(class,cf_date,eyear,year20,eweek,date)%>%
+  summarize(visitors=mean(visitors,na.rm=T))%>%
+  group_by(class,cf_date)%>%
+  arrange(eyear,.by_group=TRUE)%>%
+  mutate(visitors=case_when(first(eyear)==2019 & last(eyear==2020)~visitors-first(visitors)))%>%
+  group_by(class)%>%
+  arrange(class,date,.by_group = TRUE)%>%
+  mutate(visitors=zoo::rollapplyr(visitors,7,mean,partial=TRUE,na.rm=TRUE))%>%
+  filter(eweek %in% 6:22, eyear==2020)%>%
+  ggplot(aes(x=date,y=visitors,group=class,color=class))+
+  geom_line()+
+  scale_color_discrete("")+
+  theme_light()+
+  theme(legend.position = "bottom")+
+  scale_y_continuous(str_wrap("Difference (2020-2019) in 7-day rolling average visitors",32))+
+  scale_x_date("Date",date_breaks="2 weeks",date_minor_breaks = "1 weeks",date_labels = "%b-%e")
+```
+
+
+## Figure 3
+
+```{r event-study1,fig.cap="Event study of elective procedure bans"}
+
+es_1<-
+  fepois(visitors~
+         i(relative_time_elective,year20,ref="-1")+
+          i(relative_time_elective,ref="-1")+
+         i(relative_time_stayhome,year20,ref="-1")+
+          i(relative_time_stayhome,ref="-1")
+        |placekey+cf_date,
+       data=filter(analytic,n_days==max(n_days), eweek %in% 6:22,relative_time_elective %in% -49:49,relative_time_elective<0 | elective_ban==1), cluster=~state_fips)
+
+ggiplot::ggiplot(es_1,geom_style = "ribbon")+
+  scale_x_continuous("Days to elective procedure ban",
+                     breaks=seq(-49,49,by=7),minor_breaks=NULL)+
+  theme_bw()
+```
+
+
+## Table 2 Daily visits
+```{r table-2}
+model_list<-
+  list("Daily Visits"=clinic_models$`year20 + elective_ban + holiday + unemployment_rate + surgical2`,
+       "Daily Visits"=clinic_models$`year20 + elective_ban + holiday + unemployment_rate + surgical2 + new7_cases_per100k`,
+       "Daily Visits"=clinic_models$`year20 + elective_ban + holiday + unemployment_rate + surgical2 + new7_cases_per100k + stay_at_home_ne`,
+       #"Daily Visits"=clinic_models$`year20 + elective_ban + holiday + unemployment_rate + surgical2 + new7_cases_per100k + stay_at_home_ne`,
+       "Daily Visits"=clinic_models$`year20 + elective_ban + holiday + unemployment_rate + surgical2 + cum_cases_per100k`,
+       #"Daily Visits"=clinic_models$`year20 + elective_ban + holiday + unemployment_rate + surgical2 + cum_cases_per100k + stay_at_home_ne`,
+       "Daily Visits"=clinic_models$`year20 + elective_ban + holiday + unemployment_rate + surgical2 + cum_cases_per100k + stay_at_home_ne`)
+  
+
+q<-cbind(rbind("Squared correlation","Number of clinics","Chi^2 on year and ur"),rbind(
+         model_list%>%
+           map(~fitstat(.,"cor2",simplify = TRUE))%>%
+           as.data.frame(),
+         model_list%>%
+           map(~fitstat(.,"nclinics",simplify = TRUE))%>%
+           as.data.frame(),
+         model_list%>%
+           map(~round(add_Ftest(.)$p,5))%>%
+           as.data.frame()
+         )
+)
+
+# etable(model_list,se.below=TRUE,dict=coef_map)%>%
+#   knitr::kable()
+
+out_models(model_list,title="Daily visits to clinics",add_rows=q)
+```
+
+
+## Table 3
+
+```{r table-3}
+
+model_list<-
+  list("Weekly visits"=clinic_visitor_metrics$`Full sample`$weekly_visit_counts$`year20 + elective_ban + holiday + unemployment_rate + surgical2 + new7_cases_per100k + stay_at_home_ne`,
+       "Weekly visitors"=clinic_visitor_metrics$`Full sample`$weekly_visitor_counts$`year20 + elective_ban + holiday + unemployment_rate + surgical2 + new7_cases_per100k + stay_at_home_ne`,
+       "Distance from home"=clinic_visitor_metrics$`Full sample`$distance_from_home$`year20 + elective_ban + holiday + unemployment_rate + surgical2 + new7_cases_per100k + stay_at_home_ne`,
+       "Median visit duration"=clinic_visitor_metrics$`Full sample`$median_dwell$`year20 + elective_ban + holiday + unemployment_rate + surgical2 + new7_cases_per100k + stay_at_home_ne`)
+  
+q<-cbind(rbind("Squared correlation","Number of clinics","Chi^2 on year and ur"),rbind(
+         model_list%>%
+           map(~fitstat(.,"cor2",simplify = TRUE))%>%
+           as.data.frame(),
+         model_list%>%
+           map(~fitstat(.,"nclinics",simplify = TRUE))%>%
+           as.data.frame(),
+         model_list%>%
+           map(~round(add_Ftest(.)$p,5))%>%
+           as.data.frame()
+         )
+)
+
+out_models(model_list,title="Weekly visits and visitor charactreristics, clinic level",add_rows=q)
+
+```
+
+
+
+## Table 4: State level metrics of visitors
+
+```{r table-6}
+model_list<-
+  list("Weekly visits"=state_models$weekly_visit_counts$`year20 + elective_ban + holiday + unemployment_rate + surgical2 + new7_cases_per100k + stay_at_home_ne`,
+       "Weekly visitors"=state_models$weekly_visitor_counts$`year20 + elective_ban + holiday + unemployment_rate + surgical2 + new7_cases_per100k + stay_at_home_ne`,
+       "Same state"=state_models$within_state_visitors$`year20 + elective_ban + holiday + unemployment_rate + surgical2 + new7_cases_per100k + stay_at_home_ne`,
+       "Out-of-state"=state_models$outof_state_visitors$`year20 + elective_ban + holiday + unemployment_rate + surgical2 + new7_cases_per100k + stay_at_home_ne`,
+       "Left state"=state_models$left_state_visitors$`year20 + elective_ban + holiday + unemployment_rate + surgical2 + new7_cases_per100k + stay_at_home_ne`
+       )
+
+q<-cbind(rbind("Squared correlation","Number of states","Chi^2 on year and ur"),rbind(
+         model_list%>%
+           map(~fitstat(.,"cor2",simplify = TRUE))%>%
+           as.data.frame(),
+         model_list%>%
+           map(~fitstat(.,"nstates",simplify = TRUE))%>%
+           as.data.frame(),
+         model_list%>%
+           map(~round(add_Ftest(.)$p,5))%>%
+           as.data.frame()
+         )
+)
+
+out_models(model_list,title="State-level visits, visitors, and visitor flows",add_rows = q)
+
+```
+
+## Table 5: Results for clinics that provide surgical abortions
+
+```{r table-4}
+model_list<-
+  list("Daily visits"=clinic_visitor_metrics$`1`$visitors$`year20 + elective_ban + holiday + unemployment_rate + surgical2 + new7_cases_per100k + stay_at_home_ne`,
+       "Weekly visits"=clinic_visitor_metrics$`1`$weekly_visit_counts$`year20 + elective_ban + holiday + unemployment_rate + surgical2 + new7_cases_per100k + stay_at_home_ne`,
+       "Weekly visitors"=clinic_visitor_metrics$`1`$weekly_visitor_counts$`year20 + elective_ban + holiday + unemployment_rate + surgical2 + new7_cases_per100k + stay_at_home_ne`,
+       "Distance from home"=clinic_visitor_metrics$`1`$distance_from_home$`year20 + elective_ban + holiday + unemployment_rate + surgical2 + new7_cases_per100k + stay_at_home_ne`,
+       "Median visit duration"=clinic_visitor_metrics$`1`$median_dwell$`year20 + elective_ban + holiday + unemployment_rate + surgical2 + new7_cases_per100k + stay_at_home_ne`)
+
+q<-cbind(rbind("Squared correlation","Number of clinics","Chi^2 on year and ur"),rbind(
+         model_list%>%
+           map(~fitstat(.,"cor2",simplify = TRUE))%>%
+           as.data.frame(),
+         model_list%>%
+           map(~fitstat(.,"nclinics",simplify = TRUE))%>%
+           as.data.frame(),
+         model_list%>%
+           map(~round(add_Ftest(.)$p,5))%>%
+           as.data.frame()
+         )
+)
+
+
+out_models(model_list,title="Vistors, visits, and visitor characteristics to clinics that provide surgical abortion",add_rows = q)
+
+
+```
+
+
+
+
+## Table 6: Results for clinics that do not provide surgical abortions
+
+```{r table-5}
+model_list<-
+  list("Daily visits"=clinic_visitor_metrics$`0`$visitors$`year20 + elective_ban + holiday + unemployment_rate + surgical2 + new7_cases_per100k + stay_at_home_ne`,
+       "Weekly visits"=clinic_visitor_metrics$`0`$weekly_visit_counts$`year20 + elective_ban + holiday + unemployment_rate + surgical2 + new7_cases_per100k + stay_at_home_ne`,
+       "Weekly visitors"=clinic_visitor_metrics$`0`$weekly_visitor_counts$`year20 + elective_ban + holiday + unemployment_rate + surgical2 + new7_cases_per100k + stay_at_home_ne`,
+       "Distance from home"=clinic_visitor_metrics$`0`$distance_from_home$`year20 + elective_ban + holiday + unemployment_rate + surgical2 + new7_cases_per100k + stay_at_home_ne`,
+       "Median visit duration"=clinic_visitor_metrics$`0`$median_dwell$`year20 + elective_ban + holiday + unemployment_rate + surgical2 + new7_cases_per100k + stay_at_home_ne`)
+
+q<-cbind(rbind("Squared correlation","Number of clinics","Chi^2 on year and ur"),rbind(
+         model_list%>%
+           map(~fitstat(.,"cor2",simplify = TRUE))%>%
+           as.data.frame(),
+         model_list%>%
+           map(~fitstat(.,"nclinics",simplify = TRUE))%>%
+           as.data.frame(),
+         model_list%>%
+           map(~round(add_Ftest(.)$p,5))%>%
+           as.data.frame()
+         )
+)
+
+
+out_models(model_list,title="Vistors, visits, and visitor characteristics to clinics that do not provide surgical abortion",add_rows = q)
+
+```
+
+# Appendix
+## Appendix Table 1: Drop interpolated clinics
+
+```{r estimate2, cache=TRUE}
+# clinic level models
+clinic_visitor_metrics2<-
+  fepois(fml=c(visitors,
+               weekly_visit_counts,
+               weekly_visitor_counts,
+               distance_from_home,
+               median_dwell
+               )
+         ~year20+elective_ban+surgical2+holiday+unemployment_rate+new7_cases_per100k+stay_at_home_ne| placekey+eweek^dow,
+         data=filter(analytic,n_days==max(n_days), dow %in% 2:6, eweek %in% 6:22,max_interpolated==0), cluster=~state_fips)
+
+```
+
+```{r table-7}
+model_list<-
+  list("Visitors"             =clinic_visitor_metrics2$visitors,
+       "Weekly visits"        =clinic_visitor_metrics2$weekly_visit_counts,
+       "Weekly visitors"      =clinic_visitor_metrics2$weekly_visitor_counts,
+       "Distance from home"   =clinic_visitor_metrics2$distance_from_home,
+       "Median visit duration"=clinic_visitor_metrics2$median_dwell
+       )
+
+q<-cbind(rbind("Squared correlation","Number of clinics","Chi^2 on year and ur"),rbind(
+         model_list%>%
+           map(~fitstat(.,"cor2",simplify = TRUE))%>%
+           as.data.frame(),
+         model_list%>%
+           map(~fitstat(.,"nclinics",simplify = TRUE))%>%
+           as.data.frame(),
+         model_list%>%
+           map(~round(add_Ftest(.)$p,5))%>%
+           as.data.frame()
+         )
+)
+
+out_models(model_list,title="Clinic-level outcomes, excluding interpolated clinics",add_rows = q)
+```
+
+## Appendix Figure 2: Covid cases by state policy
+```{r covid_time,fig.cap="Covid Cases by State Policy"}
+analytic%>%
+  filter(n_days==max(n_days))%>%
+  filter(eweek %in% 6:22, eyear==2020)%>%
+  group_by(state_fips)%>%
+  mutate(class=case_when(max(surgical2)==1~"Surgical abortion ban",
+                         max(elective_ban)==1~"Elective procedure ban",
+                         TRUE~"No restrictions"))%>%
+  distinct(class,date,state_fips,new7_cases_per100k,cum_cases_per100k,pop)%>%
+  group_by(class,date)%>%
+  summarize(across(c(new7_cases_per100k,cum_cases_per100k),~sum(pmax(0,.)*pop)/sum(pop)))%>%
+  
+  ggplot(aes(x=date,y=new7_cases_per100k,group=class,color=class))+
+  geom_line()+
+  scale_color_discrete("")+
+  theme_light()+
+  theme(legend.position = "bottom")+
+  scale_y_continuous(str_wrap("New cases per 100,000 over last 7 days",32))+
+  scale_x_date("Date",date_breaks="2 weeks",date_minor_breaks = "1 weeks",date_labels = "%b-%e")
+```
+
+
+## Appendix Table 5: Abortion clinic visits by state
+```{r cdc-sg-data}
+
+sg_states<-
+  analytic_raw%>%
+  # inner_join(select(normalization,state_fips,date,rescale))%>%
+  # mutate(visitors=visitors*rescale)%>%
+  #filter(eweek %in% 1:23)%>%
+  group_by(state_fips,eyear)%>%
+  mutate(abortion_type=case_when(surgical_abortion==1~1,
+                                 medication_abortion==1~2),
+         )%>%
+  summarize(surgical_visitors=sum(if_else(abortion_type==1,visitors,0)),
+            medication_visitors=sum(if_else(abortion_type==2,visitors,0)),
+            visitors=sum(visitors),
+            )%>%
+  pivot_wider(names_from=eyear,values_from=c(visitors,surgical_visitors,medication_visitors))%>%
+  inner_join(tigris::fips_codes%>%
+  distinct(state_fips=state_code)%>%
+  mutate(state_fips=as.numeric(state_fips)),.)
+
+sg_cdc<-
+  cdc_mmwr_data%>%
+  mutate(state_fips=as.numeric(state_code))%>%
+  inner_join(sg_states, by="state_fips")
+
+
+```
+
+```{r sg_cdc_table}
+sg_cdc%>%
+  select(`State/Area`,total_abortions_reported,surgical_abortions,medical_abortions,visitors_2019,surgical_visitors_2019,medication_visitors_2019,visitors_2020)%>%
+  mutate(across(contains("visitors"),~replace_na(round(.,0),0)))%>%
+  knitr::kable(col.names=c("State","All abortions (2019; CDC)",
+                           "Surgical abortions (2019; CDC)",
+                           "Medication abortions (2019; CDC)",
+                           "All abortion clinic visits (2019; SG)",
+                           "All surgical abortion clinic visits (2019; SG)",
+                           "All medication-only abortion clinic visits (2019; SG)",
+                           "All abortion clinic visits (2020; SG)"),
+               caption = "CDC abortion counts and SafeGraph visits to abortion clinics")
+
+```
+
+## Appendix Figure 4: Abortions per State and Clinic Visits, Full Year
+```{r cdc-plot}
+
+sg_cdc%>%
+  mutate(postal=case_when(postal %in% c("MS","UT","MO")~postal))%>%
+  ggplot(aes(y=total_abortions_reported,x=visitors_2019,label=postal))+
+  geom_point()+
+  scale_x_log10(labels = scales::comma,name="Clinic visits in 2019 (SafeGraph)")+
+  scale_y_log10(labels = scales::comma,name="Abortions in 2019 (CDC MMWR)")+
+  geom_smooth(method="lm",formula = y~offset(x),se = FALSE)+
+  theme_minimal()+
+  geom_text(hjust=0.5,vjust=1.3)
+
+```
+
+```{r cdc-regression}
+model_list<-
+  list(
+    "All abortions"       =feols(log(total_abortions_reported)~log(visitors_2019),data=sg_cdc,vcov="hetero"),
+    "Surgical abortions"  =feols(log(surgical_abortions)~log(surgical_visitors_2019),data=sg_cdc,vcov="hetero")
+  )
+
+q<-cbind("Squared correlation",
+         model_list%>%
+           map(~fitstat(.,"cor2",simplify = TRUE))%>%
+           as.data.frame()
+         )
+
+
+# etable(model_list,se.below=TRUE,dict=coef_map)%>%
+#   knitr::kable()
+
+out_models(model_list,add_rows=q,title="Relationship between CDC-reported abortions and Safegraph visits")
+
+```
+
+
+
+```{r sab-data}
+# set up for sun and abraham estimation
+sa_data<-
+  analytic%>%
+  filter(n_days==max(n_days), dow %in% 2:6, eweek %in% 6:22)%>%
+  group_by(placekey)%>%
+  mutate(elective_start=min(if_else(elective_ban==1,date,lubridate::as_date("2100-01-01")),na.rm = TRUE),
+         elective_end=max(if_else(elective_ban==1,date,lubridate::as_date("2000-01-01")),na.rm = TRUE),
+         surgical_start=min(if_else(surgical2==1,date,lubridate::as_date("2100-01-01")),na.rm = TRUE),
+         surgical_end=max(if_else(surgical2==1,date,lubridate::as_date("2000-01-01")),na.rm = TRUE),
+         )%>%
+  ungroup()%>%
+  mutate(across(c(elective_end,surgical_end),~if_else(.==lubridate::as_date("2000-01-01"),lubridate::as_date("2100-01-01"),.)))%>%
+  filter(date<=elective_end,
+         date<=surgical_end)%>%
+  mutate(relative_time_elective=case_when(lubridate::year(date)==2019~-7,
+                                          elective_start==lubridate::as_date("2100-01-01")~-7,
+                                          TRUE~as.numeric(date-elective_start)),
+         relative_time_elective_w=floor(relative_time_elective/7),
+         relative_time_surgical=case_when(lubridate::year(date)==2019~-7,
+                                          surgical_start==lubridate::as_date("2100-01-01")~-7,
+                                          TRUE~as.numeric(date-surgical_start)),
+         relative_time_surgical_w=floor(relative_time_surgical/7),
+         
+         )
+
+sa_state_data<-
+  state_analytic%>%
+  filter(n_days==max(n_days), dow %in% 2:6, eweek %in% 6:22)%>%
+  group_by(state_fips)%>%
+  mutate(elective_start=min(if_else(elective_ban==1,date,lubridate::as_date("2100-01-01")),na.rm = TRUE),
+         elective_end=max(if_else(elective_ban==1,date,lubridate::as_date("2000-01-01")),na.rm = TRUE),
+         surgical_start=min(if_else(surgical2==1,date,lubridate::as_date("2100-01-01")),na.rm = TRUE),
+         surgical_end=max(if_else(surgical2==1,date,lubridate::as_date("2000-01-01")),na.rm = TRUE),
+         )%>%
+  ungroup()%>%
+  mutate(across(c(elective_end,surgical_end),~if_else(.==lubridate::as_date("2000-01-01"),lubridate::as_date("2100-01-01"),.)))%>%
+  filter(date<=elective_end,
+         date<=surgical_end)%>%
+  mutate(relative_time_elective=case_when(lubridate::year(date)==2019~-7,
+                                          elective_start==lubridate::as_date("2100-01-01")~-7,
+                                          TRUE~as.numeric(date-elective_start)),
+         relative_time_elective_w=floor(relative_time_elective/7),
+         relative_time_surgical=case_when(lubridate::year(date)==2019~-7,
+                                          surgical_start==lubridate::as_date("2100-01-01")~-7,
+                                          TRUE~as.numeric(date-surgical_start)),
+         relative_time_surgical_w=floor(relative_time_surgical/7),
+         
+         )
+
+sa_b1<-feols(log(1+visitors)~..baseline+surgical2+new7_cases_per100k+stay_at_home_ne|placekey+eweek^dow,data=sa_data, cluster=~state_fips)
+
+sa_b2<-feols(c(log(1+weekly_visit_counts),
+               log(1+weekly_visitor_counts),
+               log(distance_from_home),
+               log(median_dwell)
+               )~..baseline+surgical2+new7_cases_per100k+stay_at_home_ne|placekey+eweek^dow,data=sa_data, cluster=~state_fips)
+
+
+sa_b3<-
+  feols(c(log(weekly_visit_counts),log(weekly_visitor_counts),log(within_state_visitors),log(outof_state_visitors),log(left_state_visitors))
+         ~..baseline+surgical2+new7_cases_per100k+stay_at_home_ne | state_fips+eweek^dow,
+               data=sa_state_data, weights=~pop, cluster=~state_fips)
+
+
+
+sa_q1<-feols(log(1+visitors)~sunab(elective_start,relative_time_elective,ref.c="2100-01-01",ref.p=c(-21,-14))+year20+surgical2+holiday+unemployment_rate+new7_cases_per100k+stay_at_home_ne|placekey+eweek^dow,data=sa_data, cluster=~state_fips)
+
+sa_q2<-feols(c(log(1+weekly_visit_counts),
+               log(1+weekly_visitor_counts),
+               log(distance_from_home),
+               log(median_dwell)
+               )~sunab(elective_start,relative_time_elective_w,ref.c="2100-01-01",ref.p=c(-3,-2))+year20+surgical2+holiday+unemployment_rate+new7_cases_per100k+stay_at_home_ne|placekey+eweek^dow,data=sa_data, cluster=~state_fips)
+
+
+sa_q3<-
+  feols(c(log(weekly_visit_counts),log(weekly_visitor_counts),log(within_state_visitors),log(outof_state_visitors),log(left_state_visitors))
+         ~sunab(elective_start,relative_time_elective_w,ref.c="2100-01-01",ref.p=c(-7))+year20+surgical2+holiday+unemployment_rate+new7_cases_per100k+stay_at_home_ne | state_fips+eweek^dow,
+               data=sa_state_data, weights=~pop, cluster=~state_fips)
+```
+
+## Appendix Table 5: Sun and Abraham Estimates of the Effect of Elective Procedure Bans
+
+```{r sab-out}
+model_list<-
+  list("Daily visits"=sa_q1,
+       "Weekly visits"=sa_q2$`log(1 + weekly_visit_counts)`,
+       "Weekly visitors"=sa_q2$`log(1 + weekly_visitor_counts)`,
+       "Distance from home"=sa_q2$`log(distance_from_home)`,
+       "Median visit duration"=sa_q2$`log(median_dwell)`
+       # ,
+       # "Weekly visits (state)"=sa_q3$`log(weekly_visit_counts)`,
+       # "Weekly visitors (state)"=sa_q3$`log(weekly_visitor_counts)`
+       )
+
+
+q<-cbind(rbind("Squared correlation","Number of clinics"),rbind(
+         model_list%>%
+           map(~fitstat(.,"cor2",simplify = TRUE))%>%
+           as.data.frame(),
+         model_list%>%
+           map(~fitstat(.,"nclinics",simplify = TRUE))%>%
+           as.data.frame()
+         )
+)
+
+out_models(model_list,title="Log-linear estimates, Sun and Abraham aggregation",agg="ATT",add_rows=q)
+
+#etable(model_list,agg="ATT")
+```
+
+## Appendix Table 6: Log-linear Estimates of the Effect of Elective Procedure Bans
+```{r ihs-out}
+model_list<-
+  list("Daily visits"=sa_b1,
+       "Weekly visits"=sa_b2$`log(1 + weekly_visit_counts)`,
+       "Weekly visitors"=sa_b2$`log(1 + weekly_visitor_counts)`,
+       "Distance from home"=sa_b2$`log(distance_from_home)`,
+       "Median visit duration"=sa_b2$`log(median_dwell)`
+       # ,
+       # "Weekly visits (state)"=sa_b3$`log(weekly_visit_counts)`,
+       # "Weekly visitors (state)"=sa_b3$`log(weekly_visitor_counts)`
+       )
+
+q<-cbind(rbind("Squared correlation","Number of clinics"),rbind(
+         model_list%>%
+           map(~fitstat(.,"cor2",simplify = TRUE))%>%
+           as.data.frame(),
+         model_list%>%
+           map(~fitstat(.,"nclinics",simplify = TRUE))%>%
+           as.data.frame()
+         )
+)
+
+
+out_models(model_list,title="Log-linear estimates, two-way fixed effects",add_rows=q)
+
+#etable(model_list,agg="ATT")
+```
+
+
+
+## Appendix Figure 5: Density of outcome variables in 2019 and 2020
+```{r clinic-hists}
+pseudo_log10_trans <- function(sigma = 1) {
+  scales::trans_new(
+    "pseudo_log10",
+    function(x) asinh(x / (2 * sigma)) / log(10),
+    function(x) 2 * sigma * sinh(x * log(10)),
+    )
+}
+
+pseudo_log10_trans()
+
+analytic%>%
+  filter(n_days==max(n_days), dow %in% 2:6, eweek %in% 6:22)%>%
+  select(placekey,eweek,dow,eyear,"Daily visits"=visitors,"Weekly visits"=weekly_visit_counts,"Weekly visitors"=weekly_visitor_counts)%>%
+  # mutate(median_dwell=median_dwell/60,
+  #        distance_from_home=distance_from_home/1600)%>%
+  pivot_longer(-c(placekey,eweek,dow,eyear))%>%
+  ggplot(aes(x=value,after_stat(density)))+
+  geom_histogram(bins=50)+
+  scale_x_continuous(trans="pseudo_log10",name=element_blank(),
+                     breaks=c(0,10,100,1000,10000))+
+  scale_y_continuous(name="Density")+
+  theme_light()+
+  facet_grid(cols=vars(eyear),
+             rows=vars(str_wrap(name,16)) ,scales = "free"
+             )
+
+```
+
+## Appendix Table 7: Zero-Inflated models
+```{r zero-inflated}
+# clinic level models
+visitors_zeros<-feglm(visitors>0~..baseline+surgical2+new7_cases_per100k+stay_at_home_ne| placekey+eweek^dow, data=filter(analytic,n_days==max(n_days), dow %in% 2:6, eweek %in% 6:22), cluster=~state_fips, family=binomial(link="probit"))
+visitors_zip<-feglm(visitors~..baseline+surgical2+new7_cases_per100k+stay_at_home_ne| placekey+eweek^dow, data=filter(analytic,n_days==max(n_days), dow %in% 2:6, eweek %in% 6:22,visitors>0), cluster=~state_fips, family=poisson(link="log"))
+
+weekly_visit_counts_zeros<-feglm(weekly_visit_counts>0~..baseline+surgical2+new7_cases_per100k+stay_at_home_ne| placekey+eweek^dow, data=filter(analytic,n_days==max(n_days), dow %in% 2:6, eweek %in% 6:22), cluster=~state_fips, family=binomial(link="probit"))
+weekly_visit_counts_zip<-feglm(weekly_visit_counts~..baseline+surgical2+new7_cases_per100k+stay_at_home_ne| placekey+eweek^dow, data=filter(analytic,n_days==max(n_days), dow %in% 2:6, eweek %in% 6:22,weekly_visit_counts>0), cluster=~state_fips, family=poisson(link="log"))
+
+weekly_visitor_counts_zeros<-feglm(weekly_visitor_counts>0~..baseline+surgical2+new7_cases_per100k+stay_at_home_ne| placekey+eweek^dow, data=filter(analytic,n_days==max(n_days), dow %in% 2:6, eweek %in% 6:22), cluster=~state_fips, family=binomial(link="probit"))
+weekly_visitor_counts_zip<-feglm(weekly_visitor_counts~..baseline+surgical2+new7_cases_per100k+stay_at_home_ne| placekey+eweek^dow, data=filter(analytic,n_days==max(n_days), dow %in% 2:6, eweek %in% 6:22,weekly_visitor_counts>0), cluster=~state_fips, family=poisson(link="log"))
+
+
+model_list=list(
+  "Any Visits"=visitors_zeros,
+  "Visits | Any"=visitors_zip,
+  "Any Weekly Visit"=weekly_visit_counts_zeros,
+  "Weekly Visits | Any"=weekly_visit_counts_zip,
+  "Weekly Visitors | Any"=weekly_visitor_counts_zip
+)
+
+q<-cbind(rbind("Number of clinics","Squared correlation","Chi^2 on year and ur"),rbind(
+         model_list%>%
+           map(~fitstat(.,"nclinics",simplify = TRUE))%>%
+           as.data.frame(),
+         model_list%>%
+           map(~fitstat(.,"cor2",simplify = TRUE))%>%
+           as.data.frame(),
+         model_list%>%
+           map(~round(add_Ftest(.)$p,5))%>%
+           as.data.frame()
+         )
+)
+
+# etable(model_list,se.below=TRUE,dict=coef_map)%>%
+#   knitr::kable()
+
+out_models(model_list,title="Zero-Inflated models",add_rows=q)
+```
+
+```{r planb-strat}
+
+clinics_planb<-
+  fepois(fml=c(visitors,
+               weekly_visit_counts,
+               weekly_visitor_counts,
+               distance_from_home,
+               median_dwell
+               )
+         ~year20+elective_ban+surgical2+holiday+unemployment_rate+new7_cases_per100k+stay_at_home_ne| placekey+eweek^dow,
+         data=filter(analytic,n_days==max(n_days), dow %in% 2:6, eweek %in% 6:22), cluster=~state_fips,
+         split=~any_planb_restriction)
+
+clinics_hostility<-
+  fepois(fml=c(visitors,
+               weekly_visit_counts,
+               weekly_visitor_counts,
+               distance_from_home,
+               median_dwell
+               )
+         ~year20+elective_ban+surgical2+holiday+unemployment_rate+new7_cases_per100k+stay_at_home_ne| placekey+eweek^dow,
+         data=filter(analytic,n_days==max(n_days), dow %in% 2:6, eweek %in% 6:22), cluster=~state_fips,
+         split=~gm_coarse)
+
+clinics_negbin<-
+  fenegbin(fml=c(visitors,
+               weekly_visit_counts,
+               weekly_visitor_counts,
+               distance_from_home,
+               median_dwell
+               )
+         ~year20+elective_ban+surgical2+holiday+unemployment_rate+new7_cases_per100k+stay_at_home_ne| placekey+eweek^dow,
+         data=filter(analytic,n_days==max(n_days), dow %in% 2:6, eweek %in% 6:22), cluster=~state_fips,
+         )
+
+
+clinics_mobility<-
+  fepois(fml=c(visitors,
+               weekly_visit_counts,
+               weekly_visitor_counts,
+               distance_from_home,
+               median_dwell
+               )
+         ~year20+elective_ban+surgical2+holiday+unemployment_rate+new7_cases_per100k+stay_at_home_ne+log(total_visits)| placekey+eweek^dow,
+         data=filter(analytic,n_days==max(n_days), dow %in% 2:6, eweek %in% 6:22), cluster=~state_fips,
+         )
+
+```
+
+## Appendix Table 8: Contraceptives must be dispensed
+```{r}
+
+
+q<-cbind(rbind("Number of clinics","Squared correlation","Chi^2 on year and ur"),rbind(
+         clinics_planb$`No contraception restriction`%>%
+           map(~fitstat(.,"nclinics",simplify = TRUE))%>%
+           as.data.frame(),
+         clinics_planb$`No contraception restriction`%>%
+           map(~fitstat(.,"cor2",simplify = TRUE))%>%
+           as.data.frame(),
+         clinics_planb$`No contraception restriction`%>%
+           map(~round(add_Ftest(.)$p,5))%>%
+           as.data.frame()
+         )
+)
+
+out_models(clinics_planb$`No contraception restriction`, add_rows=q, title="Contraceptives must be dispensed")
+```
+
+## Appendix Table 9: Pharmacist may refuse to dispense
+
+
+```{r}
+
+
+q<-cbind(rbind("Number of clinics","Squared correlation","Chi^2 on year and ur"),rbind(
+         clinics_planb$`Provider/pharmacist may refuse contraception`%>%
+           map(~fitstat(.,"nclinics",simplify = TRUE))%>%
+           as.data.frame(),
+         clinics_planb$`Provider/pharmacist may refuse contraception`%>%
+           map(~fitstat(.,"cor2",simplify = TRUE))%>%
+           as.data.frame(),
+         clinics_planb$`Provider/pharmacist may refuse contraception`%>%
+           map(~round(add_Ftest(.)$p,5))%>%
+           as.data.frame()
+         )
+)
+
+
+out_models(clinics_planb$`Provider/pharmacist may refuse contraception`, add_rows=q, title="Pharmacist may refuse to dispense")
+```
+
+
+## Appendix Table 10: State is hostile to abortion
+
+```{r}
+q<-cbind(rbind("Number of clinics","Squared correlation","Chi^2 on year and ur"),rbind(
+         clinics_hostility$Hostile%>%
+           map(~fitstat(.,"nclinics",simplify = TRUE))%>%
+           as.data.frame(),
+         clinics_hostility$Hostile%>%
+           map(~fitstat(.,"cor2",simplify = TRUE))%>%
+           as.data.frame(),
+         clinics_hostility$Hostile%>%
+           map(~round(add_Ftest(.)$p,5))%>%
+           as.data.frame()
+         )
+)
+
+
+out_models(clinics_hostility$Hostile, add_rows=q, title="State is hostile to abortion")
+```
+
+
+## Appendix Table 11: State is supportive of abortion
+```{r}
+q<-cbind(rbind("Number of clinics","Squared correlation","Chi^2 on year and ur"),rbind(
+         clinics_hostility$Supportive%>%
+           map(~fitstat(.,"nclinics",simplify = TRUE))%>%
+           as.data.frame(),
+         clinics_hostility$Supportive%>%
+           map(~fitstat(.,"cor2",simplify = TRUE))%>%
+           as.data.frame(),
+         clinics_hostility$Supportive%>%
+           map(~round(add_Ftest(.)$p,5))%>%
+           as.data.frame()
+         )
+)
+
+
+out_models(clinics_hostility$Supportive, add_rows=q, title="State if supportive of abortion")
+```
+## Appendix Table 12: Negative binomial estimates
+
+```{r}
+q<-cbind(rbind("Number of clinics","Squared correlation","Chi^2 on year and ur"),rbind(
+         clinics_negbin%>%
+           map(~fitstat(.,"nclinics",simplify = TRUE))%>%
+           as.data.frame(),
+         clinics_negbin%>%
+           map(~fitstat(.,"cor2",simplify = TRUE))%>%
+           as.data.frame(),
+         clinics_negbin%>%
+           map(~round(add_Ftest(.)$p,5))%>%
+           as.data.frame()
+         )
+)
+
+
+out_models(clinics_negbin, add_rows=q, title="Negative binomial estimates")
+```
+
+
+## Appendix Table 13: Includes trends in total mobility
+
+
+```{r}
+q<-cbind(rbind("Number of clinics","Squared correlation","Chi^2 on year and ur"),rbind(
+         clinics_mobility%>%
+           map(~fitstat(.,"nclinics",simplify = TRUE))%>%
+           as.data.frame(),
+         clinics_mobility%>%
+           map(~fitstat(.,"cor2",simplify = TRUE))%>%
+           as.data.frame(),
+         clinics_mobility%>%
+           map(~round(add_Ftest(.)$p,5))%>%
+           as.data.frame()
+         )
+)
+
+
+out_models(clinics_mobility, add_rows=q, title="Includes trends in total mobility")
+```
+
+
+
+## Appendix Figure 6: Number of devices seen by day
+```{r devices-seen-by-day, fig.cap="Number of devices seen, by day"}
+normalization%>%
+  fgroup_by(date)%>%
+  fsum()%>%
+  filter(date<"2022-01-01")%>%
+  ggplot(aes(x=date))+
+  geom_point(aes(y=total_devices_seen/10^6))+
+  scale_y_continuous(name="Devices seen (millions)", limits=c(0,NA))+
+  scale_x_date(name="Date",date_breaks="4 months", date_labels = "%b %y")+
+  theme_minimal()
+```
+
+## Appendix Figure 7: Number of visits by day
+```{r visits-by-day, fig.cap="Number of visits by day"}
+normalization%>%
+  mutate(scaled_visits=total_visits*rescale)%>%
+  fgroup_by(date)%>%
+  fsum()%>%
+  filter(date<"2022-01-01")%>%
+  ggplot(aes(x=date))+
+  geom_point(aes(y=total_visits/10^6))+
+  scale_y_continuous(name="Total visits (millions)", limits=c(0,NA))+
+  scale_x_date(name="Date",date_breaks="4 months", date_labels = "%b %y")+
+  theme_minimal()
+```
+
